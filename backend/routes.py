@@ -1,22 +1,30 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime, date
-import sqlite3
-from auth import get_current_user, require_admin, create_user, authenticate_user, create_access_token, UserCreate, UserLogin, Token, get_password_hash
+from typing import Optional
+from database import get_db
+from auth import hash_password, verify_password, create_access_token, get_current_user, require_admin
+from datetime import date
 
 router = APIRouter()
 
-# Pydantic models
+# ─── MODELS ─────────────────────────────────────────────────────────────────
+
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str = "member"
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 class ProjectCreate(BaseModel):
     name: str
     description: Optional[str] = None
 
-class Project(BaseModel):
-    id: int
-    name: str
-    description: Optional[str]
-    created_by: int
+class AddMembersRequest(BaseModel):
+    user_ids: list[int]
 
 class TaskCreate(BaseModel):
     title: str
@@ -24,280 +32,306 @@ class TaskCreate(BaseModel):
     deadline: Optional[str] = None
     project_id: int
     assigned_to: Optional[int] = None
-    assigned_type: str = "user"
+    assigned_type: str  # "user" or "team"
 
-class Task(BaseModel):
-    id: int
-    title: str
-    description: Optional[str]
+class TaskUpdate(BaseModel):
     status: str
-    deadline: Optional[str]
-    project_id: int
-    assigned_to: Optional[int]
-    assigned_type: str
-    created_by: int
-    overdue: bool = False
 
-class ProjectMember(BaseModel):
-    user_id: int
-    project_id: int
+# ─── AUTH ────────────────────────────────────────────────────────────────────
 
-# Auth routes
-@router.post("/api/auth/signup", response_model=dict)
-async def signup(user: UserCreate):
-    return create_user(user)
+@router.post("/auth/signup")
+def signup(req: SignupRequest):
+    db = get_db()
+    existing = db.execute("SELECT id FROM users WHERE email = ?", (req.email,)).fetchone()
+    if existing:
+        raise HTTPException(400, "Email already registered")
+    if req.role not in ("admin", "member"):
+        raise HTTPException(400, "Role must be admin or member")
+    hashed = hash_password(req.password)
+    db.execute("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
+               (req.name, req.email, hashed, req.role))
+    db.commit()
+    db.close()
+    return {"message": "Account created successfully"}
 
-@router.post("/api/auth/login", response_model=Token)
-async def login(user_credentials: UserLogin):
-    user = authenticate_user(user_credentials.email, user_credentials.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token = create_access_token(data={"sub": str(user["id"])})
-    return {"access_token": access_token, "token_type": "bearer"}
+@router.post("/auth/login")
+def login(req: LoginRequest):
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
+    db.close()
+    if not user or not verify_password(req.password, user["password"]):
+        raise HTTPException(401, "Invalid email or password")
+    token = create_access_token({
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user["role"]
+    })
+    return {"access_token": token, "user": {"id": user["id"], "name": user["name"], "role": user["role"]}}
 
-@router.get("/api/auth/me")
-async def get_me(current_user: dict = Depends(get_current_user)):
+@router.get("/auth/me")
+def me(current_user=Depends(get_current_user)):
     return current_user
 
-# Project routes
-@router.post("/api/projects", response_model=dict)
-async def create_project(project: ProjectCreate, current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    cursor.execute(
+# ─── USERS ───────────────────────────────────────────────────────────────────
+
+@router.get("/users")
+def list_users(current_user=Depends(require_admin)):
+    db = get_db()
+    users = db.execute("SELECT id, name, email, role FROM users").fetchall()
+    db.close()
+    return [dict(u) for u in users]
+
+# ─── PROJECTS ────────────────────────────────────────────────────────────────
+
+@router.post("/projects")
+def create_project(req: ProjectCreate, current_user=Depends(require_admin)):
+    db = get_db()
+    cur = db.execute(
         "INSERT INTO projects (name, description, created_by) VALUES (?, ?, ?)",
-        (project.name, project.description, current_user["id"])
+        (req.name, req.description, current_user["id"])
     )
-    project_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return {"id": project_id, "name": project.name, "description": project.description, "created_by": current_user["id"]}
+    project_id = cur.lastrowid
+    # Admin is also a member of their own project
+    db.execute("INSERT OR IGNORE INTO project_members (user_id, project_id) VALUES (?, ?)",
+               (current_user["id"], project_id))
+    db.commit()
+    db.close()
+    return {"id": project_id, "message": "Project created"}
 
-@router.get("/api/projects", response_model=List[dict])
-async def get_projects(current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect("taskflow.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
+@router.get("/projects")
+def list_projects(current_user=Depends(get_current_user)):
+    db = get_db()
     if current_user["role"] == "admin":
-        cursor.execute("SELECT * FROM projects")
+        projects = db.execute(
+            "SELECT p.*, u.name as creator_name FROM projects p JOIN users u ON p.created_by = u.id WHERE p.created_by = ?",
+            (current_user["id"],)
+        ).fetchall()
     else:
-        cursor.execute("""
-            SELECT p.* FROM projects p
-            JOIN project_members pm ON p.id = pm.project_id
+        projects = db.execute(
+            """SELECT p.*, u.name as creator_name FROM projects p 
+               JOIN users u ON p.created_by = u.id
+               JOIN project_members pm ON pm.project_id = p.id 
+               WHERE pm.user_id = ?""",
+            (current_user["id"],)
+        ).fetchall()
+    db.close()
+    return [dict(p) for p in projects]
+
+@router.get("/projects/{project_id}")
+def get_project(project_id: int, current_user=Depends(get_current_user)):
+    db = get_db()
+    project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    # Check access
+    if current_user["role"] == "member":
+        member = db.execute(
+            "SELECT id FROM project_members WHERE user_id = ? AND project_id = ?",
+            (current_user["id"], project_id)
+        ).fetchone()
+        if not member:
+            raise HTTPException(403, "Access denied")
+    db.close()
+    return dict(project)
+
+@router.post("/projects/{project_id}/members")
+def add_members(project_id: int, req: AddMembersRequest, current_user=Depends(require_admin)):
+    db = get_db()
+    project = db.execute("SELECT id FROM projects WHERE id = ? AND created_by = ?",
+                         (project_id, current_user["id"])).fetchone()
+    if not project:
+        raise HTTPException(404, "Project not found or access denied")
+    for uid in req.user_ids:
+        db.execute("INSERT OR IGNORE INTO project_members (user_id, project_id) VALUES (?, ?)",
+                   (uid, project_id))
+    db.commit()
+    db.close()
+    return {"message": f"{len(req.user_ids)} member(s) added"}
+
+@router.get("/projects/{project_id}/members")
+def get_members(project_id: int, current_user=Depends(get_current_user)):
+    db = get_db()
+    members = db.execute(
+        """SELECT u.id, u.name, u.email, u.role FROM users u
+           JOIN project_members pm ON pm.user_id = u.id
+           WHERE pm.project_id = ?""",
+        (project_id,)
+    ).fetchall()
+    db.close()
+    return [dict(m) for m in members]
+
+@router.delete("/projects/{project_id}/members/{user_id}")
+def remove_member(project_id: int, user_id: int, current_user=Depends(require_admin)):
+    db = get_db()
+    db.execute("DELETE FROM project_members WHERE project_id = ? AND user_id = ?",
+               (project_id, user_id))
+    db.commit()
+    db.close()
+    return {"message": "Member removed"}
+
+# ─── TASKS ───────────────────────────────────────────────────────────────────
+
+@router.post("/tasks")
+def create_task(req: TaskCreate, current_user=Depends(require_admin)):
+    if req.assigned_type not in ("user", "team"):
+        raise HTTPException(400, "assigned_type must be 'user' or 'team'")
+    if req.assigned_type == "user" and not req.assigned_to:
+        raise HTTPException(400, "assigned_to is required for user tasks")
+    db = get_db()
+    project = db.execute("SELECT id FROM projects WHERE id = ? AND created_by = ?",
+                         (req.project_id, current_user["id"])).fetchone()
+    if not project:
+        raise HTTPException(404, "Project not found or access denied")
+    cur = db.execute(
+        """INSERT INTO tasks (title, description, deadline, project_id, assigned_to, assigned_type, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (req.title, req.description, req.deadline, req.project_id,
+         req.assigned_to if req.assigned_type == "user" else None,
+         req.assigned_type, current_user["id"])
+    )
+    task_id = cur.lastrowid
+    db.commit()
+    db.close()
+    return {"id": task_id, "message": "Task created"}
+
+@router.get("/tasks")
+def list_tasks(project_id: Optional[int] = None, current_user=Depends(get_current_user)):
+    db = get_db()
+    today = date.today().isoformat()
+
+    if current_user["role"] == "admin":
+        query = """
+            SELECT t.*, u.name as assignee_name, p.name as project_name
+            FROM tasks t
+            LEFT JOIN users u ON t.assigned_to = u.id
+            JOIN projects p ON t.project_id = p.id
+            WHERE t.created_by = ?
+        """
+        params = [current_user["id"]]
+        if project_id:
+            query += " AND t.project_id = ?"
+            params.append(project_id)
+    else:
+        query = """
+            SELECT t.*, u.name as assignee_name, p.name as project_name
+            FROM tasks t
+            LEFT JOIN users u ON t.assigned_to = u.id
+            JOIN projects p ON t.project_id = p.id
+            JOIN project_members pm ON pm.project_id = t.project_id
             WHERE pm.user_id = ?
-        """, (current_user["id"],))
-    
-    projects = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return projects
+              AND (
+                (t.assigned_type = 'team')
+                OR (t.assigned_type = 'user' AND t.assigned_to = ?)
+              )
+        """
+        params = [current_user["id"], current_user["id"]]
+        if project_id:
+            query += " AND t.project_id = ?"
+            params.append(project_id)
 
-@router.post("/api/projects/{project_id}/members", response_model=dict)
-async def add_project_member(project_id: int, member: ProjectMember, current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    
-    # Verify project exists
-    cursor.execute("SELECT id FROM projects WHERE id = ?", (project_id,))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # Add member
-    cursor.execute(
-        "INSERT OR IGNORE INTO project_members (user_id, project_id) VALUES (?, ?)",
-        (member.user_id, project_id)
-    )
-    conn.commit()
-    conn.close()
-    return {"message": "Member added successfully"}
+    tasks = db.execute(query, params).fetchall()
+    db.close()
 
-@router.get("/api/projects/{project_id}/members", response_model=List[dict])
-async def get_project_members(project_id: int, current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect("taskflow.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Verify user has access to project
-    if current_user["role"] != "admin":
-        cursor.execute("SELECT id FROM project_members WHERE project_id = ? AND user_id = ?", 
-                      (project_id, current_user["id"]))
-        if not cursor.fetchone():
-            conn.close()
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    cursor.execute("""
-        SELECT u.id, u.name, u.email, u.role
-        FROM users u
-        JOIN project_members pm ON u.id = pm.user_id
-        WHERE pm.project_id = ?
-    """, (project_id,))
-    
-    members = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return members
+    result = []
+    for t in tasks:
+        task_dict = dict(t)
+        task_dict["overdue"] = (
+            bool(task_dict.get("deadline")) and
+            task_dict["deadline"] < today and
+            task_dict["status"] != "done"
+        )
+        result.append(task_dict)
+    return result
 
-@router.delete("/api/projects/{project_id}/members/{user_id}")
-async def remove_project_member(project_id: int, user_id: int, current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM project_members WHERE project_id = ? AND user_id = ?", (project_id, user_id))
-    conn.commit()
-    conn.close()
-    return {"message": "Member removed successfully"}
+@router.get("/tasks/{task_id}")
+def get_task(task_id: int, current_user=Depends(get_current_user)):
+    db = get_db()
+    task = db.execute(
+        "SELECT t.*, u.name as assignee_name FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id WHERE t.id = ?",
+        (task_id,)
+    ).fetchone()
+    if not task:
+        raise HTTPException(404, "Task not found")
+    db.close()
+    return dict(task)
 
-# Task routes
-@router.post("/api/tasks", response_model=dict)
-async def create_task(task: TaskCreate, current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    
-    # Verify project exists
-    cursor.execute("SELECT id FROM projects WHERE id = ?", (task.project_id,))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    cursor.execute(
-        """INSERT INTO tasks (title, description, status, deadline, project_id, assigned_to, assigned_type, created_by)
-           VALUES (?, ?, 'todo', ?, ?, ?, ?, ?)""",
-        (task.title, task.description, task.deadline, task.project_id, task.assigned_to, task.assigned_type, current_user["id"])
-    )
-    task_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
+@router.put("/tasks/{task_id}")
+def update_task(task_id: int, req: TaskUpdate, current_user=Depends(get_current_user)):
+    if req.status not in ("todo", "in_progress", "done"):
+        raise HTTPException(400, "Invalid status")
+    db = get_db()
+    task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not task:
+        raise HTTPException(404, "Task not found")
+    # Members can only update tasks assigned to them
+    if current_user["role"] == "member":
+        if not (
+            (task["assigned_type"] == "user" and task["assigned_to"] == current_user["id"]) or
+            (task["assigned_type"] == "team")
+        ):
+            raise HTTPException(403, "You can only update your own tasks")
+    db.execute("UPDATE tasks SET status = ? WHERE id = ?", (req.status, task_id))
+    db.commit()
+    db.close()
+    return {"message": "Status updated"}
+
+@router.delete("/tasks/{task_id}")
+def delete_task(task_id: int, current_user=Depends(require_admin)):
+    db = get_db()
+    db.execute("DELETE FROM tasks WHERE id = ? AND created_by = ?", (task_id, current_user["id"]))
+    db.commit()
+    db.close()
+    return {"message": "Task deleted"}
+
+# ─── REPORTS ─────────────────────────────────────────────────────────────────
+
+@router.get("/reports")
+def get_reports(current_user=Depends(require_admin)):
+    db = get_db()
+    today = date.today().isoformat()
+
+    projects = db.execute(
+        "SELECT id, name FROM projects WHERE created_by = ?", (current_user["id"],)
+    ).fetchall()
+
+    report = []
+    total_tasks = 0
+    total_done = 0
+    total_overdue = 0
+
+    for project in projects:
+        pid = project["id"]
+        tasks = db.execute("SELECT * FROM tasks WHERE project_id = ?", (pid,)).fetchall()
+        done = sum(1 for t in tasks if t["status"] == "done")
+        overdue = sum(1 for t in tasks if t["deadline"] and t["deadline"] < today and t["status"] != "done")
+        members_count = db.execute(
+            "SELECT COUNT(*) as cnt FROM project_members WHERE project_id = ?", (pid,)
+        ).fetchone()["cnt"]
+
+        total_tasks += len(tasks)
+        total_done += done
+        total_overdue += overdue
+
+        report.append({
+            "project_id": pid,
+            "project_name": project["name"],
+            "total_tasks": len(tasks),
+            "done": done,
+            "in_progress": sum(1 for t in tasks if t["status"] == "in_progress"),
+            "todo": sum(1 for t in tasks if t["status"] == "todo"),
+            "overdue": overdue,
+            "completion_pct": round((done / len(tasks)) * 100) if tasks else 0,
+            "members": members_count
+        })
+
+    db.close()
     return {
-        "id": task_id,
-        "title": task.title,
-        "description": task.description,
-        "status": "todo",
-        "deadline": task.deadline,
-        "project_id": task.project_id,
-        "assigned_to": task.assigned_to,
-        "assigned_type": task.assigned_type,
-        "created_by": current_user["id"]
-    }
-
-@router.get("/api/tasks", response_model=List[dict])
-async def get_tasks(current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect("taskflow.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    if current_user["role"] == "admin":
-        cursor.execute("""
-            SELECT t.*, 
-                   CASE WHEN t.deadline < date('now') AND t.status != 'done' THEN 1 ELSE 0 END as overdue
-            FROM tasks t
-        """)
-    else:
-        cursor.execute("""
-            SELECT t.*, 
-                   CASE WHEN t.deadline < date('now') AND t.status != 'done' THEN 1 ELSE 0 END as overdue
-            FROM tasks t
-            WHERE (
-                t.assigned_type = 'user' AND t.assigned_to = ?
-            ) OR (
-                t.assigned_type = 'team' AND t.project_id IN (
-                    SELECT project_id FROM project_members WHERE user_id = ?
-                )
-            )
-        """, (current_user["id"], current_user["id"]))
-    
-    tasks = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return tasks
-
-@router.put("/api/tasks/{task_id}", response_model=dict)
-async def update_task(task_id: int, task_update: dict, current_user: dict = Depends(get_current_user)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    
-    # Verify task exists and user has access
-    if current_user["role"] != "admin":
-        cursor.execute("""
-            SELECT id FROM tasks 
-            WHERE id = ? AND (
-                (assigned_type = 'user' AND assigned_to = ?) OR
-                (assigned_type = 'team' AND project_id IN (
-                    SELECT project_id FROM project_members WHERE user_id = ?
-                ))
-            )
-        """, (task_id, current_user["id"], current_user["id"]))
-        if not cursor.fetchone():
-            conn.close()
-            raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Update task
-    set_clauses = []
-    values = []
-    
-    if "status" in task_update:
-        set_clauses.append("status = ?")
-        values.append(task_update["status"])
-    
-    if set_clauses:
-        sql = f"UPDATE tasks SET {', '.join(set_clauses)} WHERE id = ?"
-        values.append(task_id)
-        cursor.execute(sql, values)
-        conn.commit()
-    
-    conn.close()
-    return {"message": "Task updated successfully"}
-
-@router.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: int, current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    conn.commit()
-    conn.close()
-    return {"message": "Task deleted successfully"}
-
-# Reports route (admin only)
-@router.get("/api/reports")
-async def get_reports(current_user: dict = Depends(require_admin)):
-    conn = sqlite3.connect("taskflow.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Get completion percentage
-    cursor.execute("SELECT COUNT(*) as total FROM tasks")
-    total_tasks = cursor.fetchone()["total"]
-    
-    cursor.execute("SELECT COUNT(*) as completed FROM tasks WHERE status = 'done'")
-    completed_tasks = cursor.fetchone()["completed"]
-    
-    completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
-    
-    # Get overdue count
-    cursor.execute("""
-        SELECT COUNT(*) as overdue FROM tasks 
-        WHERE deadline < date('now') AND status != 'done'
-    """)
-    overdue_count = cursor.fetchone()["overdue"]
-    
-    # Get per-project stats
-    cursor.execute("""
-        SELECT p.name, COUNT(t.id) as task_count,
-               COUNT(CASE WHEN t.status = 'done' THEN 1 END) as completed_count
-        FROM projects p
-        LEFT JOIN tasks t ON p.id = t.project_id
-        GROUP BY p.id, p.name
-    """)
-    
-    project_stats = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    
-    return {
-        "completion_rate": completion_rate,
-        "overdue_count": overdue_count,
-        "total_tasks": total_tasks,
-        "completed_tasks": completed_tasks,
-        "project_stats": project_stats
+        "summary": {
+            "total_tasks": total_tasks,
+            "total_done": total_done,
+            "total_overdue": total_overdue,
+            "overall_completion_pct": round((total_done / total_tasks) * 100) if total_tasks else 0
+        },
+        "projects": report
     }
