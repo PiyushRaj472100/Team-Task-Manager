@@ -167,15 +167,3 @@ taskflow/
 └── README.md
 ```
 
----
-
-## 🎯 Interview Talking Points
-
-**"How did you implement teams?"**
-> "Each project has a many-to-many relationship with users via a `project_members` join table. No separate team entity is needed — the team IS the set of members for a project. This lets users belong to multiple projects across different admins."
-
-**"How do you handle task visibility?"**
-> "Tasks have an `assigned_type` field: `team` or `user`. When fetching, the SQL query filters accordingly — team tasks show to all project members via a JOIN on `project_members`, user tasks filter by `assigned_to = current_user_id`."
-
-**"How does auth work?"**
-> "JWT tokens signed with HS256. On login, we issue a token containing user ID, name, email, and role. FastAPI dependency injection validates the token on every protected route. Role checks happen at the endpoint level using a `require_admin` dependency."
