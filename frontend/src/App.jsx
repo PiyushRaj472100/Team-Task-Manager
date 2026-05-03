@@ -1,7 +1,7 @@
 import React, { useState, useEffect, createContext, useContext } from "react";
 
 // ─── API LAYER ────────────────────────────────────────────────────────────────
-const BASE = "http://localhost:8000/api";
+const BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 const getToken = () => localStorage.getItem("token");
 
 async function req(method, path, body = null) {
